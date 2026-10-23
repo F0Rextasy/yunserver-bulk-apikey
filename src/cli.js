@@ -77,6 +77,7 @@ const has = (n) => argv.includes(`--${n}`);
 const HELP = `${path.basename(ROOT)}-bulk-apikey — mint keys for ${HOST} (one account per key, every key chat-verified)
 
   --count N        accounts to mint (default 1)
+  --auto           non-interactive run (the launcher/menu path; never prompts)
   --pool FILE      exit list, one proxy per line (env ${ENV}; without one the tool runs direct)
   --proxy URL      pin a single exit for the panel calls
   --exits K        exit candidates tried per key (default 6)
@@ -543,7 +544,7 @@ async function mintOne(n) {
     appendKey(key);
   } else if (key) {
     rec.verdict = 'key-unverified';
-    appendDead(key, deadClass(rec.proof));
+    if (/^(401|403|quota|ban)$/.test(deadClass(rec.proof))) appendDead(key, deadClass(rec.proof));   // 429/5xx/transport = key death DEGIL
   } else {
     rec.verdict = 'no-key';
   }
