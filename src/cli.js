@@ -56,6 +56,11 @@ const SENDER = /@(yunserver\.(cn|com)|email\.cheliz\.ai)$/i;   // the panel's ow
 const DEFAULT_GROUP = 'default';       // `default` answers "No available channel…"
 const GROUP_TRY = ['default', 'deepseek'];
 const PROMPT = 'Reply with the single word: pong';
+// Two-prompt sanity + a function-calling round: a key reaches keys.txt only when
+// the panel answers 200, the second answer differs from the first, and the model
+// emits the `get_time` tool call (mirrors the fleet's pre-add gate).
+const PROMPT2 = 'Name three colours, comma separated.';
+const TOOLS = [{ type: 'function', function: { name: 'get_time', description: 'Returns the current time', parameters: { type: 'object', properties: {} } } }];
 const MODEL_PREFS = [/deepseek-v4\.1-flash/i, /deepseek/i, /flash|mini|nano|turbo|free/i];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36';
 const EMAILNATOR = 'https://www.emailnator.com';
@@ -204,7 +209,8 @@ async function newMailbox() {
           const dotted = r.json && r.json.email;
           if (dotted && /@gmail\.com$/i.test(dotted)) {
             const [local, domain] = dotted.split('@');
-            return { address: `${local.replace(/\./g, '')}@${domain}`, kind, box: { dotted } };
+            const plain = `${local.replace(/\./g, '')}@${domain}`;
+            return { address: plain, kind, box: { dotted, plain } };
           }
         }
         await sleep(8000);
@@ -235,8 +241,22 @@ async function inbox(mb) {
     if (mb.kind === 'emailnator') {
       // Only heads here: the body is one more request per message, and most of a
       // shared public inbox is other people's mail (fetched lazily in waitForCode).
-      const r = await json_https('/api/message-list', { method: 'POST', body: { email: mb.box.dotted || mb.address, limit: 20 } });
-      return ((r.json && r.json.messages) || []).map((m) => ({ id: String(m.id), from: m.from, subject: m.subject }));
+      // The list is keyed by the exact address form: the panel mails the dot-stripped
+      // address, so mail to it is invisible under the dotted query and vice versa
+      // (measured 2026-10-23). Both forms are queried and merged.
+      const forms = [...new Set([mb.box.dotted, mb.box.plain, mb.address].filter(Boolean))];
+      const out = [];
+      const ids = new Set();
+      for (const f of forms) {
+        const r = await json_https('/api/message-list', { method: 'POST', body: { email: f, limit: 20 } });
+        for (const m of ((r.json && r.json.messages) || [])) {
+          const id = String(m.id);
+          if (!id || ids.has(id)) continue;
+          ids.add(id);
+          out.push({ id, from: m.from, subject: m.subject });
+        }
+      }
+      return out;
     }
     const r = await brokerHttp(`/list?token=${encodeURIComponent(mb.box.token || '')}`);
     return ((r.json && r.json.messages) || []).map((m) => ({ id: String(m.id), from: m.from, subject: m.subject, text: `${m.text || ''} ${m.html || ''}` }));
@@ -250,23 +270,28 @@ async function inboxIds(mb) {
 }
 
 async function waitForCode(mb, { timeoutMs = CODE_WAIT_MS, pre = [] } = {}) {
-  const deadline = Date.now() + timeoutMs;
+  const started = Date.now();
+  const deadline = started + timeoutMs;
   // A shared inbox already holds other people's mail: only messages that land
   // AFTER the code request may carry the panel's code (measured: the first run
   // picked a freedns activation mail out of a stale box).
   const seen = new Set(pre);
+  // The loose fallback only opens for a PRIVATE box, and only after the panel's own
+  // mail has had a fair run. On the shared emailnator pool it must stay shut: a
+  // "QuickConnect 441707" / "Verificar la Dirección…" message was read as our code
+  // and register answered "Verification code is incorrect or has expired"
+  // (measured 2026-10-23, 2 accounts burned) — a no-mail miss is cheaper.
+  const looseAt = mb.kind === 'emailnator' ? Number.POSITIVE_INFINITY : started + Math.min(Math.round(timeoutMs / 2), 120000);
   while (Date.now() < deadline) {
     const msgs = await inbox(mb);
-    // brand-tagged first, then anything new that carries a code
-    for (const pass of [1, 2]) {
+    const passes = Date.now() >= looseAt ? [1, 2] : [1];
+    for (const pass of passes) {
       for (const m of msgs) {
         if (seen.has(m.id)) continue;
         const hay = `${m.from || ''} ${m.subject || ''}`;
-        // Only a message that *reads* like a verification mail may be read for a
-        // code — a shared inbox is mostly marketing, and a truncated body once
-        // handed back a number out of a stylesheet.
-        const codeish = BRAND.test(hay) || SENDER.test(String(m.from || '')) || /verif|code|注册|验证|confirm|activ|安全/i.test(hay);
-        if (pass === 1 && !codeish) continue;
+        const brandish = BRAND.test(hay) || SENDER.test(String(m.from || ''));
+        const codeish = brandish || /verif|code|注册|验证|confirm|activ|安全/i.test(hay);
+        if (pass === 1 && !brandish) continue;
         let raw = m.text;
         if (raw === undefined && mb.kind === 'emailnator') {
           const full = await json_https(`/api/message/${encodeURIComponent(m.id)}`);
@@ -304,6 +329,50 @@ function appendAccount(rec) {
   all.push(rec);
   fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(all, null, 1) + '\n');
 }
+const DAY = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+const MINT_JSONL = path.join(OUT_DIR, `mint-100-${path.basename(ROOT)}-${DAY}.jsonl`);
+const DEAD_FILE = path.join(ROOT, 'keys-dead.txt');
+/** A minted-but-dead key keeps its class (401/403/quota/ban/429 or a gate miss). */
+function deadClass(p) {
+  if (!p) return 'unverified';
+  const s = p.chat && p.chat.status;
+  if (s === 401) return '401';
+  if (s === 403) return '403';
+  if (s === 429) return '429';
+  if (s === 402) return 'quota';
+  if (p.sanity && (!p.sanity.live || !p.sanity.different)) return 'sanity-fail';
+  if (p.tools && !p.tools.present) return 'tools-fail';
+  if (!s) return 'transport';
+  return 'unverified';
+}
+function appendDead(key, cls) {
+  const old = fs.existsSync(DEAD_FILE) ? fs.readFileSync(DEAD_FILE, 'utf8') : '';
+  if (old.includes(key)) return;
+  fs.appendFileSync(DEAD_FILE, (old && !old.endsWith('\n') ? '\n' : '') + `${key}\t# ${cls}` + '\n');
+}
+/** One evidence row per account, whatever the outcome. */
+function rowOf(rec) {
+  const key = rec.apiKey;
+  const p = rec.proof;
+  return {
+    at: rec.at, n: rec.n, email: rec.email, mailbox: rec.mailbox || '?', exit: rec.exit,
+    code: rec.steps && rec.steps.mail ? rec.steps.mail.code || null : null,
+    register: rec.steps && rec.steps.register ? rec.steps.register.status : null,
+    self: rec.self || null, group: rec.group || null,
+    key: key ? key.slice(0, 8) + '…' : null,
+    proof: p ? {
+      models: p.models, chat: { model: p.chat.model, status: p.chat.status, content: String(p.chat.content || '').slice(0, 60) },
+      sanity: p.sanity ? { status: p.sanity.status, different: p.sanity.different, content: String(p.sanity.content || '').slice(0, 60) } : null,
+      tools: p.tools || null, exit: p.exit, live: !!p.live,
+    } : null,
+    verdict: rec.verdict, deadClass: rec.verdict === 'minted' ? null : deadClass(p),
+  };
+}
+function finish(rec) {
+  appendAccount(rec);
+  fs.appendFileSync(MINT_JSONL, JSON.stringify(rowOf(rec)) + '\n');
+  return rec;
+}
 
 // ---------------------------------------------------------------------- proof
 function listModels(key, exit) {
@@ -321,30 +390,39 @@ function pickModels(ids) {
   return out.slice(0, 4);
 }
 
-function chatGate(key, model, exit, group) {
-  if (!model) return { status: 0, content: null, live: false, text: 'no model id' };
+/** One chat call; returns content, any tool-call names, and the raw status. */
+function chatCall(key, model, exit, group, body) {
+  if (!model) return { status: 0, content: null, names: [], live: false, text: 'no model id' };
   const r = curl(`${BASE}/v1/chat/completions`, {
     method: 'POST', exit, headers: { authorization: `Bearer ${key}`, 'x-group': group || '' },
-    body: { model, messages: [{ role: 'user', content: PROMPT }], max_tokens: 64, stream: false },
+    body: { model, max_tokens: 256, stream: false, ...body },
   });
   const m0 = r.json && r.json.choices && r.json.choices[0] && r.json.choices[0].message;
-  const content = m0 && (m0.content || m0.reasoning_content || m0.reasoning);
-  return { status: r.status, content: content || null, live: r.status === 200 && !!content, text: String(r.text || '').slice(0, 200) };
+  const content = (m0 && (m0.content || m0.reasoning_content || m0.reasoning)) || null;
+  const names = ((m0 && m0.tool_calls) || []).map((x) => x && x.function && x.function.name).filter(Boolean);
+  return { status: r.status, content, names, live: r.status === 200 && !!content, text: String(r.text || '').slice(0, 200) };
 }
+const chatGate = (key, model, exit, group) => chatCall(key, model, exit, group, { messages: [{ role: 'user', content: PROMPT }], max_tokens: 64 });
 
-function prove(key) {
-  const attempts = Math.max(exits.length, 3);
+function prove(key, group) {
+  // 6 exits is plenty to prove a key; the whole pool made a dead key burn every
+  // exit at ~10 s per models call.
+  const attempts = Math.min(Math.max(exits.length, 3), 6);
   let last = null;
   for (let i = 0; i < attempts; i++) {
     const exit = nextExit();
     const models = listModels(key, exit);
     if (models.status !== 200) { last = { models: { status: models.status, count: 0 }, chat: { model: null, status: 0, content: null, live: false, text: 'models unreachable' }, exit, live: false }; continue; }
     for (const model of pickModels(models.ids)) {
-      const chat = chatGate(key, model, exit);
-      const res = { models: { status: models.status, count: models.ids.length }, chat: { model, ...chat }, exit, live: chat.live };
-      if (chat.live) return res;
-      last = res;
-      if (chat.status === 200) return res;
+      const p1 = chatGate(key, model, exit, group);
+      const res = { models: { status: models.status, count: models.ids.length }, chat: { model, ...p1 }, exit, live: false };
+      if (!p1.live) { last = res; if (p1.status === 200) return res; continue; }
+      const s = chatCall(key, model, exit, group, { messages: [{ role: 'user', content: PROMPT2 }], max_tokens: 64 });
+      res.sanity = { status: s.status, content: s.content, different: !!s.content && String(s.content).trim().toLowerCase() !== String(p1.content).trim().toLowerCase(), live: s.live };
+      const t = chatCall(key, model, exit, group, { messages: [{ role: 'user', content: 'What time is it right now? Use the get_time tool.' }], tools: TOOLS, tool_choice: 'auto' });
+      res.tools = { status: t.status, present: t.names.length > 0, names: t.names };
+      res.live = res.sanity.live && res.sanity.different && res.tools.present;
+      return res;
     }
   }
   return last || { models: { status: 0, count: 0 }, chat: { model: null, status: 0, content: null, live: false, text: 'relay unreachable' }, exit: null, live: false };
@@ -354,12 +432,10 @@ function prove(key) {
 async function mintOne(n) {
   let exit = nextExit();
   const jar = path.join(os.tmpdir(), `yunserver-jar-${crypto.randomBytes(4).toString('hex')}.txt`);
-  const mb = await newMailbox();
-  const email = mb.address;
   const username = randUser();
   const password = randPass();
-  const rec = { at: new Date().toISOString(), n, email, mailbox: mb.kind, username, password, exit: exitLabel(exit), steps: {} };
-  log(`#${n} ${email} (${mb.kind}) user=${username} exit=${exitLabel(exit)}`);
+  const rec = { at: new Date().toISOString(), n, username, password, exit: exitLabel(exit), steps: {} };
+  log(`#${n} user=${username} exit=${exitLabel(exit)}`);
 
   // Free exits die between calls; a step that dies on the transport gets the next exit.
   const call = (p, opts = {}) => {
@@ -370,16 +446,32 @@ async function mintOne(n) {
     }
     return { status: 0, json: null, text: 'transport failed on every exit' };
   };
-  const pre = await inboxIds(mb);
-  const send = call(`/api/verification?email=${encodeURIComponent(email)}`);
-  rec.steps.sendCode = { status: send.status, body: msg(send) };
-  log(`  send-code → ${send.status} ${msg(send)}`);
-  if (!(send.json && send.json.success)) { rec.verdict = 'send-code-failed'; appendAccount(rec); return rec; }
 
+  // Emailnator is a shared pool: an address is regularly already registered on the
+  // panel ("Email address is already in use"), so a fresh box is pulled instead of
+  // giving the account up (measured 2026-10-23: 2 of 8 attempts died this way).
+  let mb = null;
+  let email = null;
+  let pre = [];
+  let send = null;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    mb = await newMailbox();
+    email = mb.address;
+    pre = await inboxIds(mb);
+    send = call(`/api/verification?email=${encodeURIComponent(email)}`);
+    rec.steps[`sendCode@${attempt}`] = { status: send.status, email, body: msg(send) };
+    log(`  send-code@${attempt} ${email} (${mb.kind}) → ${send.status} ${msg(send)}`);
+    if (send.json && send.json.success) break;
+    if (!/already|已被|已经被/i.test(String(msg(send)))) break;
+  }
+  rec.email = email;
+  rec.mailbox = mb.kind;
+  rec.steps.sendCode = { status: send.status, body: msg(send) };
+  if (!(send.json && send.json.success)) { rec.verdict = 'send-code-failed'; return finish(rec); }
   const mail = await waitForCode(mb, { pre });
   rec.steps.mail = { code: mail.code, subject: mail.subject || null, from: mail.from || null };
   log(`  code ${mail.code || 'NONE'} «${String(mail.subject || '').slice(0, 50)}»`);
-  if (!mail.code) { rec.verdict = 'no-mail'; appendAccount(rec); return rec; }
+  if (!mail.code) { rec.verdict = 'no-mail'; return finish(rec); }
 
   const reg = call('/api/user/register', {
     method: 'POST',
@@ -387,7 +479,7 @@ async function mintOne(n) {
   });
   rec.steps.register = { status: reg.status, body: msg(reg) };
   log(`  register → ${reg.status} ${msg(reg)}`);
-  if (!(reg.json && reg.json.success)) { rec.verdict = 'register-failed'; appendAccount(rec); return rec; }
+  if (!(reg.json && reg.json.success)) { rec.verdict = 'register-failed'; return finish(rec); }
 
   let auth = (reg.json.data && reg.json.data.access_token) || null;
   if (!auth) {
@@ -431,9 +523,9 @@ async function mintOne(n) {
     if (!cand) { log(`  token@${group} → key NONE`); continue; }
     tokenId = item.id;
     usedGroup = item.group || group;
-    const proof = prove(cand);
+    const proof = prove(cand, usedGroup);
     rec.proof = proof;
-    log(`  gate@${usedGroup}: models=${proof.models.status}(${proof.models.count}) chat[${proof.chat.model}]=${proof.chat.status} ${proof.live ? '✔ LIVE' : '✖ ' + String(proof.chat.text || '').slice(0, 90)}`);
+    log(`  gate@${usedGroup}: models=${proof.models.status}(${proof.models.count}) chat[${proof.chat.model}]=${proof.chat.status} sanity=${proof.sanity ? (proof.sanity.different ? 'farklı' : 'aynı/boş') : '-'} tools=${proof.tools ? (proof.tools.present ? proof.tools.names.join('+') : 'yok') : '-'} ${proof.live ? '✔ LIVE' : '✖ ' + String(proof.chat.text || '').slice(0, 90)}`);
     if (proof.live || proof.chat.status === 200) { key = cand; break; }
     // a closed group is the only reason to keep the token and re-bind it
     if (!/group|分组|channel|模型/i.test(String(proof.chat.text || ''))) { key = cand; break; }
@@ -448,11 +540,11 @@ async function mintOne(n) {
     appendKey(key);
   } else if (key) {
     rec.verdict = 'key-unverified';
+    appendDead(key, deadClass(rec.proof));
   } else {
     rec.verdict = 'no-key';
   }
-  appendAccount(rec);
-  return rec;
+  return finish(rec);
 }
 
 // --------------------------------------------------------------------- modes
