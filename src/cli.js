@@ -32,6 +32,9 @@
  *   node src/cli.js --connect-9router         # register the keys with a local 9Router
  */
 
+// Captcha-wall classifier (walls are named in the account record; a rail is used only
+// if the operator wired one — see ADVANCED.md).
+const solver = require('./solver.js');
 require('dns').setDefaultResultOrder('ipv4first');
 const fs = require('fs');
 const os = require('os');
@@ -467,7 +470,7 @@ async function mintOne(n) {
   rec.email = email;
   rec.mailbox = mb.kind;
   rec.steps.sendCode = { status: send.status, body: msg(send) };
-  if (!(send.json && send.json.success)) { rec.verdict = 'send-code-failed'; return finish(rec); }
+  if (!(send.json && send.json.success)) { rec.verdict = 'send-code-failed'; rec.captcha = solver.classify(msg(send)); return finish(rec); }
   const mail = await waitForCode(mb, { pre });
   rec.steps.mail = { code: mail.code, subject: mail.subject || null, from: mail.from || null };
   log(`  code ${mail.code || 'NONE'} «${String(mail.subject || '').slice(0, 50)}»`);
